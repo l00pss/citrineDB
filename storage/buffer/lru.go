@@ -66,7 +66,3 @@ func (l *lruList) pop() (int, bool) {
 	l.remove(node.frameIdx)
 	return node.frameIdx, true
 }
-
-func (l *lruList) size() int {
-	return len(l.idx)
-}
