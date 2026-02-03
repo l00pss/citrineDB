@@ -243,6 +243,11 @@ func (r *Rows) Count() int {
 	return len(r.rows)
 }
 
+// Values returns the current row values (alias for Row)
+func (r *Rows) Values() []interface{} {
+	return r.Row()
+}
+
 func scanValue(dest, src interface{}) error {
 	switch d := dest.(type) {
 	case *int:

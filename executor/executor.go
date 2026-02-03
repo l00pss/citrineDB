@@ -3,10 +3,13 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/l00pss/citrinedb/storage/catalog"
 	"github.com/l00pss/citrinedb/storage/record"
+	"github.com/l00pss/citrinedb/storage/tx"
 	"github.com/l00pss/citrinelexer"
+	"github.com/l00pss/walrus"
 )
 
 var (
@@ -15,6 +18,8 @@ var (
 	ErrTypeMismatch         = errors.New("executor: type mismatch")
 	ErrNullConstraint       = errors.New("executor: null constraint violation")
 	ErrInvalidDataType      = errors.New("executor: invalid data type")
+	ErrNoActiveTransaction  = errors.New("executor: no active transaction")
+	ErrTransactionActive    = errors.New("executor: transaction already active")
 )
 
 // Result represents the result of a query execution
@@ -36,13 +41,24 @@ func NewResult() *Result {
 
 // Executor handles SQL statement execution
 type Executor struct {
-	catalog *catalog.Catalog
+	catalog    *catalog.Catalog
+	wal        *tx.WALManager
+	activeTxID walrus.TransactionID
+	inTx       bool
 }
 
 // NewExecutor creates a new executor
 func NewExecutor(cat *catalog.Catalog) *Executor {
 	return &Executor{
 		catalog: cat,
+	}
+}
+
+// NewExecutorWithWAL creates a new executor with WAL support
+func NewExecutorWithWAL(cat *catalog.Catalog, wal *tx.WALManager) *Executor {
+	return &Executor{
+		catalog: cat,
+		wal:     wal,
 	}
 }
 
@@ -69,6 +85,12 @@ func (e *Executor) ExecuteStatement(stmt citrinelexer.Statement) (*Result, error
 		return e.executeUpdate(s)
 	case *citrinelexer.DeleteStatement:
 		return e.executeDelete(s)
+	case *citrinelexer.BeginStatement:
+		return e.executeBegin(s)
+	case *citrinelexer.CommitStatement:
+		return e.executeCommit(s)
+	case *citrinelexer.RollbackStatement:
+		return e.executeRollback(s)
 	default:
 		return nil, ErrUnsupportedStatement
 	}
@@ -119,26 +141,83 @@ func (e *Executor) executeCreateTable(stmt *citrinelexer.CreateTableStatement) (
 
 // executeSelect handles SELECT statements
 func (e *Executor) executeSelect(stmt *citrinelexer.SelectStatement) (*Result, error) {
-	if stmt.From == nil || stmt.From.Name == nil {
+	// Check if this is a JOIN query
+	if len(stmt.Joins) > 0 {
+		return e.executeSelectJoin(stmt)
+	}
+
+	// Handle TableRef type for From
+	var tableName string
+	var tableAlias string
+
+	if stmt.From == nil {
+		// Check if this is a simple aggregate query
+		if len(stmt.Fields) > 0 {
+			if _, ok := stmt.Fields[0].(*citrinelexer.FunctionCall); ok {
+				return nil, errors.New("executor: SELECT requires FROM clause")
+			}
+		}
 		return nil, errors.New("executor: SELECT requires FROM clause")
 	}
 
-	tableName := stmt.From.Name.Name
+	// Extract table name from TableRef
+	if stmt.From.Name != nil {
+		tableName = stmt.From.Name.Name
+	} else {
+		return nil, errors.New("executor: SELECT requires FROM clause")
+	}
+
+	// Extract alias if present
+	if stmt.From.Alias != nil {
+		tableAlias = stmt.From.Alias.Name
+	}
+
+	// Build alias map for qualified column resolution
+	aliasMap := make(map[string]string) // alias -> tableName
+	if tableAlias != "" {
+		aliasMap[tableAlias] = tableName
+	}
+	aliasMap[tableName] = tableName // table name also works as alias
+
 	tableInfo, err := e.catalog.GetTable(tableName)
 	if err != nil {
 		return nil, fmt.Errorf("executor: table '%s' not found", tableName)
+	}
+
+	// Check if we have aggregate functions
+	hasAggregate := false
+	for _, field := range stmt.Fields {
+		if _, ok := field.(*citrinelexer.FunctionCall); ok {
+			hasAggregate = true
+			break
+		}
+	}
+
+	if hasAggregate {
+		return e.executeSelectAggregate(stmt, tableInfo)
 	}
 
 	selectAll := false
 	var columnNames []string
 
 	for _, field := range stmt.Fields {
-		if ident, ok := field.(*citrinelexer.Identifier); ok {
-			if ident.Name == "*" {
+		switch f := field.(type) {
+		case *citrinelexer.Identifier:
+			if f.Name == "*" {
 				selectAll = true
-				break
+			} else {
+				columnNames = append(columnNames, f.Name)
 			}
-			columnNames = append(columnNames, ident.Name)
+		case *citrinelexer.QualifiedIdentifier:
+			// Handle table.column or alias.column
+			tableRef := f.Table
+			colName := f.Column
+
+			// Verify table reference matches our table or alias
+			if _, ok := aliasMap[tableRef]; !ok {
+				return nil, fmt.Errorf("executor: unknown table or alias '%s'", tableRef)
+			}
+			columnNames = append(columnNames, colName)
 		}
 	}
 
@@ -196,6 +275,170 @@ func (e *Executor) executeSelect(stmt *citrinelexer.SelectStatement) (*Result, e
 	}
 
 	return result, nil
+}
+
+// executeSelectAggregate handles SELECT with aggregate functions
+func (e *Executor) executeSelectAggregate(stmt *citrinelexer.SelectStatement, tableInfo *catalog.TableInfo) (*Result, error) {
+	result := NewResult()
+
+	// Collect all rows first
+	var rows []*record.Record
+	iter := tableInfo.HeapFile.NewIterator()
+	defer iter.Close()
+
+	for {
+		rec, _, err := iter.Next()
+		if err != nil {
+			return nil, fmt.Errorf("executor: scan error: %w", err)
+		}
+		if rec == nil {
+			break
+		}
+
+		if stmt.Where != nil {
+			match, err := e.evaluateWhere(stmt.Where, rec, tableInfo.Schema)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
+		rows = append(rows, rec)
+	}
+
+	// Process each field
+	var values []interface{}
+	for _, field := range stmt.Fields {
+		switch f := field.(type) {
+		case *citrinelexer.FunctionCall:
+			val, colName, err := e.evaluateAggregateFunc(f, rows, tableInfo.Schema)
+			if err != nil {
+				return nil, err
+			}
+			result.Columns = append(result.Columns, colName)
+			values = append(values, val)
+		case *citrinelexer.Identifier:
+			result.Columns = append(result.Columns, f.Name)
+			if len(rows) > 0 {
+				colIdx, ok := tableInfo.Schema.FieldIndex(f.Name)
+				if ok {
+					v, _ := rows[0].Get(colIdx)
+					values = append(values, valueToInterface(v))
+				} else {
+					values = append(values, nil)
+				}
+			} else {
+				values = append(values, nil)
+			}
+		}
+	}
+
+	if len(values) > 0 {
+		result.Rows = append(result.Rows, values)
+	}
+
+	return result, nil
+}
+
+// evaluateAggregateFunc evaluates an aggregate function
+func (e *Executor) evaluateAggregateFunc(f *citrinelexer.FunctionCall, rows []*record.Record, schema *record.Schema) (interface{}, string, error) {
+	funcName := f.Name
+	colName := funcName + "(*)"
+
+	// Get column name if specified
+	var targetCol string
+	if len(f.Args) > 0 {
+		if ident, ok := f.Args[0].(*citrinelexer.Identifier); ok {
+			targetCol = ident.Name
+			if targetCol != "*" {
+				colName = funcName + "(" + targetCol + ")"
+			}
+		}
+	}
+
+	switch funcName {
+	case "COUNT":
+		return int64(len(rows)), colName, nil
+
+	case "SUM":
+		if targetCol == "" || targetCol == "*" {
+			return nil, colName, errors.New("executor: SUM requires a column name")
+		}
+		colIdx, ok := schema.FieldIndex(targetCol)
+		if !ok {
+			return nil, colName, fmt.Errorf("executor: column '%s' not found", targetCol)
+		}
+		var sum float64
+		for _, rec := range rows {
+			val, _ := rec.Get(colIdx)
+			sum += toFloat64(valueToInterface(val))
+		}
+		return sum, colName, nil
+
+	case "AVG":
+		if targetCol == "" || targetCol == "*" {
+			return nil, colName, errors.New("executor: AVG requires a column name")
+		}
+		colIdx, ok := schema.FieldIndex(targetCol)
+		if !ok {
+			return nil, colName, fmt.Errorf("executor: column '%s' not found", targetCol)
+		}
+		if len(rows) == 0 {
+			return nil, colName, nil
+		}
+		var sum float64
+		for _, rec := range rows {
+			val, _ := rec.Get(colIdx)
+			sum += toFloat64(valueToInterface(val))
+		}
+		return sum / float64(len(rows)), colName, nil
+
+	case "MIN":
+		if targetCol == "" || targetCol == "*" {
+			return nil, colName, errors.New("executor: MIN requires a column name")
+		}
+		colIdx, ok := schema.FieldIndex(targetCol)
+		if !ok {
+			return nil, colName, fmt.Errorf("executor: column '%s' not found", targetCol)
+		}
+		if len(rows) == 0 {
+			return nil, colName, nil
+		}
+		minVal := toFloat64(valueToInterface(func() record.Value { v, _ := rows[0].Get(colIdx); return v }()))
+		for _, rec := range rows {
+			val, _ := rec.Get(colIdx)
+			v := toFloat64(valueToInterface(val))
+			if v < minVal {
+				minVal = v
+			}
+		}
+		return minVal, colName, nil
+
+	case "MAX":
+		if targetCol == "" || targetCol == "*" {
+			return nil, colName, errors.New("executor: MAX requires a column name")
+		}
+		colIdx, ok := schema.FieldIndex(targetCol)
+		if !ok {
+			return nil, colName, fmt.Errorf("executor: column '%s' not found", targetCol)
+		}
+		if len(rows) == 0 {
+			return nil, colName, nil
+		}
+		maxVal := toFloat64(valueToInterface(func() record.Value { v, _ := rows[0].Get(colIdx); return v }()))
+		for _, rec := range rows {
+			val, _ := rec.Get(colIdx)
+			v := toFloat64(valueToInterface(val))
+			if v > maxVal {
+				maxVal = v
+			}
+		}
+		return maxVal, colName, nil
+
+	default:
+		return nil, colName, fmt.Errorf("executor: unsupported function '%s'", funcName)
+	}
 }
 
 // executeInsert handles INSERT statements
@@ -292,7 +535,7 @@ func (e *Executor) executeUpdate(stmt *citrinelexer.UpdateStatement) (*Result, e
 
 		for colIdx, expr := range updates {
 			field := tableInfo.Schema.Fields[colIdx]
-			val, err := e.expressionToValue(expr, field.Type)
+			val, err := e.evaluateExpressionWithContext(expr, field.Type, rec, tableInfo.Schema)
 			if err != nil {
 				return nil, fmt.Errorf("executor: column '%s': %w", field.Name, err)
 			}
@@ -367,6 +610,22 @@ func (e *Executor) evaluateWhere(expr citrinelexer.Expression, rec *record.Recor
 	switch ex := expr.(type) {
 	case *citrinelexer.BinaryExpression:
 		return e.evaluateBinaryExpr(ex, rec, schema)
+	case *citrinelexer.BooleanLiteral:
+		return ex.Value, nil
+	case *citrinelexer.Identifier:
+		// Check if it's a column with boolean value
+		colIdx, ok := schema.FieldIndex(ex.Name)
+		if ok {
+			val, err := rec.Get(colIdx)
+			if err != nil {
+				return false, err
+			}
+			if val.Type == record.FieldTypeBool {
+				b, _ := val.AsBool()
+				return b, nil
+			}
+		}
+		return false, nil
 	default:
 		return false, ErrInvalidExpression
 	}
@@ -472,6 +731,13 @@ func toFloat64(v interface{}) float64 {
 func (e *Executor) expressionToInterface(expr citrinelexer.Expression) interface{} {
 	switch ex := expr.(type) {
 	case *citrinelexer.NumberLiteral:
+		// Try to parse as int first, then float
+		if i, err := citrinelexer.ParseInt(ex.Value); err == nil {
+			return i
+		}
+		if f, err := citrinelexer.ParseFloat(ex.Value); err == nil {
+			return f
+		}
 		return ex.Value
 	case *citrinelexer.StringLiteral:
 		return ex.Value
@@ -502,6 +768,8 @@ func (e *Executor) expressionToValue(expr citrinelexer.Expression, targetType re
 			return record.BoolValue(ex.Value), nil
 		}
 		return record.Value{}, ErrTypeMismatch
+	case *citrinelexer.NullLiteral:
+		return record.NullValue(), nil
 	case *citrinelexer.Identifier:
 		if ex.Name == "NULL" {
 			return record.NullValue(), nil
@@ -509,6 +777,126 @@ func (e *Executor) expressionToValue(expr citrinelexer.Expression, targetType re
 		return record.Value{}, ErrInvalidExpression
 	default:
 		return record.Value{}, ErrInvalidExpression
+	}
+}
+
+// evaluateExpressionWithContext evaluates an expression with row context (for UPDATE SET)
+func (e *Executor) evaluateExpressionWithContext(expr citrinelexer.Expression, targetType record.FieldType, rec *record.Record, schema *record.Schema) (record.Value, error) {
+	switch ex := expr.(type) {
+	case *citrinelexer.NumberLiteral:
+		num, err := citrinelexer.ParseFloat(ex.Value)
+		if err != nil {
+			return record.Value{}, fmt.Errorf("invalid number: %s", ex.Value)
+		}
+		return numberToValue(num, targetType)
+	case *citrinelexer.StringLiteral:
+		if targetType == record.FieldTypeString {
+			return record.StringValue(ex.Value), nil
+		}
+		return record.Value{}, ErrTypeMismatch
+	case *citrinelexer.BooleanLiteral:
+		if targetType == record.FieldTypeBool {
+			return record.BoolValue(ex.Value), nil
+		}
+		return record.Value{}, ErrTypeMismatch
+	case *citrinelexer.NullLiteral:
+		return record.NullValue(), nil
+	case *citrinelexer.Identifier:
+		if ex.Name == "NULL" {
+			return record.NullValue(), nil
+		}
+		// Column reference - get value from current row
+		colIdx, ok := schema.FieldIndex(ex.Name)
+		if !ok {
+			return record.Value{}, fmt.Errorf("column '%s' not found", ex.Name)
+		}
+		val, err := rec.Get(colIdx)
+		if err != nil {
+			return record.Value{}, err
+		}
+		return val, nil
+	case *citrinelexer.BinaryExpression:
+		return e.evaluateBinaryExpressionWithContext(ex, targetType, rec, schema)
+	default:
+		return record.Value{}, ErrInvalidExpression
+	}
+}
+
+// evaluateBinaryExpressionWithContext evaluates arithmetic expressions like budget - 50000
+func (e *Executor) evaluateBinaryExpressionWithContext(expr *citrinelexer.BinaryExpression, targetType record.FieldType, rec *record.Record, schema *record.Schema) (record.Value, error) {
+	leftVal, err := e.evaluateExpressionWithContext(expr.Left, targetType, rec, schema)
+	if err != nil {
+		return record.Value{}, err
+	}
+
+	rightVal, err := e.evaluateExpressionWithContext(expr.Right, targetType, rec, schema)
+	if err != nil {
+		return record.Value{}, err
+	}
+
+	// Convert to float64 for arithmetic
+	leftNum, err := valueToFloat64(leftVal)
+	if err != nil {
+		return record.Value{}, fmt.Errorf("left operand: %w", err)
+	}
+
+	rightNum, err := valueToFloat64(rightVal)
+	if err != nil {
+		return record.Value{}, fmt.Errorf("right operand: %w", err)
+	}
+
+	var result float64
+	switch expr.Operator {
+	case "+":
+		result = leftNum + rightNum
+	case "-":
+		result = leftNum - rightNum
+	case "*":
+		result = leftNum * rightNum
+	case "/":
+		if rightNum == 0 {
+			return record.Value{}, fmt.Errorf("division by zero")
+		}
+		result = leftNum / rightNum
+	case "%":
+		if rightNum == 0 {
+			return record.Value{}, fmt.Errorf("modulo by zero")
+		}
+		result = float64(int64(leftNum) % int64(rightNum))
+	default:
+		return record.Value{}, fmt.Errorf("unsupported operator: %s", expr.Operator)
+	}
+
+	return numberToValue(result, targetType)
+}
+
+// valueToFloat64 converts a record.Value to float64 for arithmetic
+func valueToFloat64(v record.Value) (float64, error) {
+	if v.IsNull {
+		return 0, fmt.Errorf("cannot perform arithmetic on NULL")
+	}
+
+	switch v.Type {
+	case record.FieldTypeInt8:
+		val, _ := v.AsInt8()
+		return float64(val), nil
+	case record.FieldTypeInt16:
+		val, _ := v.AsInt16()
+		return float64(val), nil
+	case record.FieldTypeInt32:
+		val, _ := v.AsInt32()
+		return float64(val), nil
+	case record.FieldTypeInt64:
+		val, _ := v.AsInt64()
+		return float64(val), nil
+	case record.FieldTypeFloat32:
+		val, _ := v.AsFloat32()
+		return float64(val), nil
+	case record.FieldTypeFloat64:
+		val, _ := v.AsFloat64()
+		return val, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %v to number", v.Type)
 	}
 }
 
@@ -603,4 +991,358 @@ func (e *Executor) buildIndexKey(rec *record.Record, columns []string, schema *r
 		key += fmt.Sprintf("%v", valueToInterface(val))
 	}
 	return key
+}
+
+// executeBegin handles BEGIN/BEGIN TRANSACTION statements
+func (e *Executor) executeBegin(_ *citrinelexer.BeginStatement) (*Result, error) {
+	if e.inTx {
+		return nil, ErrTransactionActive
+	}
+
+	result := NewResult()
+
+	if e.wal != nil {
+		txID, err := e.wal.BeginTransaction(30 * time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("executor: failed to begin transaction: %w", err)
+		}
+		e.activeTxID = txID
+		e.inTx = true
+		result.Message = fmt.Sprintf("Transaction started (ID: %s)", txID)
+	} else {
+		e.inTx = true
+		result.Message = "Transaction started (WAL not configured)"
+	}
+
+	return result, nil
+}
+
+// executeCommit handles COMMIT statements
+func (e *Executor) executeCommit(_ *citrinelexer.CommitStatement) (*Result, error) {
+	if !e.inTx {
+		return nil, ErrNoActiveTransaction
+	}
+
+	result := NewResult()
+
+	if e.wal != nil && e.activeTxID != "" {
+		indexes, err := e.wal.CommitTransaction(e.activeTxID)
+		if err != nil {
+			return nil, fmt.Errorf("executor: failed to commit transaction: %w", err)
+		}
+		result.Message = fmt.Sprintf("Transaction committed (%d entries written)", len(indexes))
+		e.activeTxID = ""
+	} else {
+		result.Message = "Transaction committed"
+	}
+
+	e.inTx = false
+	return result, nil
+}
+
+// executeRollback handles ROLLBACK statements
+func (e *Executor) executeRollback(_ *citrinelexer.RollbackStatement) (*Result, error) {
+	if !e.inTx {
+		return nil, ErrNoActiveTransaction
+	}
+
+	result := NewResult()
+
+	if e.wal != nil && e.activeTxID != "" {
+		if err := e.wal.RollbackTransaction(e.activeTxID); err != nil {
+			return nil, fmt.Errorf("executor: failed to rollback transaction: %w", err)
+		}
+		result.Message = "Transaction rolled back"
+		e.activeTxID = ""
+	} else {
+		result.Message = "Transaction rolled back"
+	}
+
+	e.inTx = false
+	return result, nil
+}
+
+// InTransaction returns whether a transaction is active
+func (e *Executor) InTransaction() bool {
+	return e.inTx
+}
+
+// logToWAL logs an operation to the WAL if in transaction
+func (e *Executor) logToWAL(operation string, data []byte) error {
+	if e.wal == nil || !e.inTx {
+		return nil
+	}
+
+	logEntry := fmt.Sprintf("%s:%s", operation, string(data))
+	return e.wal.AddToTransaction(e.activeTxID, []byte(logEntry))
+}
+
+// executeSelectJoin handles SELECT with JOIN clauses
+func (e *Executor) executeSelectJoin(stmt *citrinelexer.SelectStatement) (*Result, error) {
+	if stmt.From == nil || stmt.From.Name == nil {
+		return nil, errors.New("executor: SELECT requires FROM clause")
+	}
+
+	// Get left table info
+	leftTableName := stmt.From.Name.Name
+	leftAlias := leftTableName
+	if stmt.From.Alias != nil {
+		leftAlias = stmt.From.Alias.Name
+	}
+
+	leftTableInfo, err := e.catalog.GetTable(leftTableName)
+	if err != nil {
+		return nil, fmt.Errorf("executor: table '%s' not found", leftTableName)
+	}
+
+	// Build table info map: alias -> (tableName, tableInfo, schemaOffset)
+	tableMap := make(map[string]*tableContext)
+	tableMap[leftAlias] = &tableContext{leftTableName, leftTableInfo, 0}
+	tableMap[leftTableName] = tableMap[leftAlias]
+
+	// Process JOIN clauses
+	var joinInfos []*struct {
+		tableCtx  *tableContext
+		alias     string
+		joinType  string
+		condition *citrinelexer.BinaryExpression
+	}
+
+	currentOffset := leftTableInfo.Schema.FieldCount()
+
+	for _, join := range stmt.Joins {
+		joinTableName := join.Table.Name.Name
+		joinAlias := joinTableName
+		if join.Table.Alias != nil {
+			joinAlias = join.Table.Alias.Name
+		}
+
+		joinTableInfo, err := e.catalog.GetTable(joinTableName)
+		if err != nil {
+			return nil, fmt.Errorf("executor: table '%s' not found", joinTableName)
+		}
+
+		ctx := &tableContext{joinTableName, joinTableInfo, currentOffset}
+		tableMap[joinAlias] = ctx
+		tableMap[joinTableName] = ctx
+
+		// Parse condition
+		var cond *citrinelexer.BinaryExpression
+		if join.Condition != nil {
+			if be, ok := join.Condition.(*citrinelexer.BinaryExpression); ok {
+				cond = be
+			}
+		}
+
+		joinInfos = append(joinInfos, &struct {
+			tableCtx  *tableContext
+			alias     string
+			joinType  string
+			condition *citrinelexer.BinaryExpression
+		}{ctx, joinAlias, join.Type, cond})
+
+		currentOffset += joinTableInfo.Schema.FieldCount()
+	}
+
+	// Get all left table rows
+	var leftRows []*record.Record
+	leftIter := leftTableInfo.HeapFile.NewIterator()
+	defer leftIter.Close()
+
+	for {
+		rec, _, err := leftIter.Next()
+		if err != nil {
+			return nil, fmt.Errorf("executor: scan error: %w", err)
+		}
+		if rec == nil {
+			break
+		}
+		leftRows = append(leftRows, rec)
+	}
+
+	// Build joined rows
+	type joinedRow struct {
+		records map[string]*record.Record // alias -> record
+	}
+
+	joinedRows := make([]*joinedRow, 0)
+
+	// Start with left table rows
+	for _, leftRec := range leftRows {
+		jr := &joinedRow{records: make(map[string]*record.Record)}
+		jr.records[leftAlias] = leftRec
+		joinedRows = append(joinedRows, jr)
+	}
+
+	// Apply each JOIN
+	for _, ji := range joinInfos {
+		// Get all rows from join table
+		var joinTableRows []*record.Record
+		joinIter := ji.tableCtx.tableInfo.HeapFile.NewIterator()
+
+		for {
+			rec, _, err := joinIter.Next()
+			if err != nil {
+				joinIter.Close()
+				return nil, fmt.Errorf("executor: scan error: %w", err)
+			}
+			if rec == nil {
+				break
+			}
+			joinTableRows = append(joinTableRows, rec)
+		}
+		joinIter.Close()
+
+		// Perform join
+		newJoinedRows := make([]*joinedRow, 0)
+
+		for _, jr := range joinedRows {
+			matched := false
+			for _, rightRec := range joinTableRows {
+				// Check join condition
+				if ji.condition != nil {
+					match, err := e.evaluateJoinCondition(ji.condition, jr.records, rightRec, ji.alias, tableMap, leftTableInfo.Schema, ji.tableCtx.tableInfo.Schema)
+					if err != nil {
+						return nil, err
+					}
+					if !match {
+						continue
+					}
+				}
+
+				// Match found - create new joined row
+				newJR := &joinedRow{records: make(map[string]*record.Record)}
+				for k, v := range jr.records {
+					newJR.records[k] = v
+				}
+				newJR.records[ji.alias] = rightRec
+				newJoinedRows = append(newJoinedRows, newJR)
+				matched = true
+			}
+
+			// For LEFT JOIN, include unmatched left rows
+			if !matched && ji.joinType == "LEFT" {
+				newJR := &joinedRow{records: make(map[string]*record.Record)}
+				for k, v := range jr.records {
+					newJR.records[k] = v
+				}
+				newJR.records[ji.alias] = nil // NULL for right side
+				newJoinedRows = append(newJoinedRows, newJR)
+			}
+		}
+
+		joinedRows = newJoinedRows
+	}
+
+	// Build result
+	result := NewResult()
+
+	// Determine columns to select
+	for _, field := range stmt.Fields {
+		switch f := field.(type) {
+		case *citrinelexer.QualifiedIdentifier:
+			result.Columns = append(result.Columns, f.Column)
+		case *citrinelexer.Identifier:
+			result.Columns = append(result.Columns, f.Name)
+		case *citrinelexer.AliasedExpression:
+			if f.Alias != "" {
+				result.Columns = append(result.Columns, f.Alias)
+			}
+		}
+	}
+
+	// Extract values
+	for _, jr := range joinedRows {
+		row := make([]interface{}, 0)
+
+		for _, field := range stmt.Fields {
+			switch f := field.(type) {
+			case *citrinelexer.QualifiedIdentifier:
+				tableCtx, ok := tableMap[f.Table]
+				if !ok {
+					return nil, fmt.Errorf("executor: unknown table or alias '%s'", f.Table)
+				}
+
+				rec := jr.records[f.Table]
+				if rec == nil {
+					row = append(row, nil)
+					continue
+				}
+
+				colIdx, ok := tableCtx.tableInfo.Schema.FieldIndex(f.Column)
+				if !ok {
+					return nil, fmt.Errorf("executor: column '%s' not found in '%s'", f.Column, f.Table)
+				}
+
+				val, _ := rec.Get(colIdx)
+				row = append(row, valueToInterface(val))
+
+			case *citrinelexer.Identifier:
+				// Try to find column in any table
+				var found bool
+				for alias, rec := range jr.records {
+					if rec == nil {
+						continue
+					}
+					tableCtx := tableMap[alias]
+					colIdx, ok := tableCtx.tableInfo.Schema.FieldIndex(f.Name)
+					if ok {
+						val, _ := rec.Get(colIdx)
+						row = append(row, valueToInterface(val))
+						found = true
+						break
+					}
+				}
+				if !found {
+					row = append(row, nil)
+				}
+			}
+		}
+
+		result.Rows = append(result.Rows, row)
+	}
+
+	return result, nil
+}
+
+// tableContext holds table info for JOIN operations
+type tableContext struct {
+	tableName    string
+	tableInfo    *catalog.TableInfo
+	schemaOffset int
+}
+
+// evaluateJoinCondition evaluates a JOIN ON condition
+func (e *Executor) evaluateJoinCondition(cond *citrinelexer.BinaryExpression, leftRecords map[string]*record.Record, rightRec *record.Record, rightAlias string, tableMap map[string]*tableContext, leftSchema *record.Schema, rightSchema *record.Schema) (bool, error) {
+	// Get left value
+	var leftVal interface{}
+	if qi, ok := cond.Left.(*citrinelexer.QualifiedIdentifier); ok {
+		if rec, exists := leftRecords[qi.Table]; exists && rec != nil {
+			tableCtx := tableMap[qi.Table]
+			colIdx, _ := tableCtx.tableInfo.Schema.FieldIndex(qi.Column)
+			val, _ := rec.Get(colIdx)
+			leftVal = valueToInterface(val)
+		} else if qi.Table == rightAlias && rightRec != nil {
+			colIdx, _ := rightSchema.FieldIndex(qi.Column)
+			val, _ := rightRec.Get(colIdx)
+			leftVal = valueToInterface(val)
+		}
+	}
+
+	// Get right value
+	var rightVal interface{}
+	if qi, ok := cond.Right.(*citrinelexer.QualifiedIdentifier); ok {
+		if rec, exists := leftRecords[qi.Table]; exists && rec != nil {
+			tableCtx := tableMap[qi.Table]
+			colIdx, _ := tableCtx.tableInfo.Schema.FieldIndex(qi.Column)
+			val, _ := rec.Get(colIdx)
+			rightVal = valueToInterface(val)
+		} else if qi.Table == rightAlias && rightRec != nil {
+			colIdx, _ := rightSchema.FieldIndex(qi.Column)
+			val, _ := rightRec.Get(colIdx)
+			rightVal = valueToInterface(val)
+		}
+	}
+
+	return e.compare(leftVal, rightVal, cond.Operator)
 }

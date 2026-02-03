@@ -8,6 +8,9 @@
 # Test binary
 *.test
 
+citrinedb
+:memory:
+
 # Output of go coverage tool
 *.out
 coverage.html
@@ -34,5 +37,3 @@ tmp/
 *.tmp
 *.log
 
-# Documentation (temporary)
-docs/
