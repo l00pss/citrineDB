@@ -1481,10 +1481,6 @@ func (e *Executor) executeSelectJoin(stmt *citrinelexer.SelectStatement) (*Resul
 	}
 
 	// Build joined rows
-	type joinedRow struct {
-		records map[string]*record.Record // alias -> record
-	}
-
 	joinedRows := make([]*joinedRow, 0)
 
 	// Start with left table rows
@@ -1575,6 +1571,21 @@ func (e *Executor) executeSelectJoin(stmt *citrinelexer.SelectStatement) (*Resul
 		joinedRows = newJoinedRows
 	}
 
+	// Apply WHERE filter to joined rows
+	if stmt.Where != nil {
+		filteredRows := make([]*joinedRow, 0)
+		for _, jr := range joinedRows {
+			match, err := e.evaluateJoinedRowWhere(stmt.Where, jr, tableMap)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				filteredRows = append(filteredRows, jr)
+			}
+		}
+		joinedRows = filteredRows
+	}
+
 	// Build result
 	result := NewResult()
 
@@ -1658,6 +1669,11 @@ type tableContext struct {
 	schemaOffset int
 }
 
+// joinedRow represents a row from joined tables
+type joinedRow struct {
+	records map[string]*record.Record // alias -> record
+}
+
 // evaluateJoinCondition evaluates a JOIN ON condition
 func (e *Executor) evaluateJoinCondition(cond *citrinelexer.BinaryExpression, leftRecords map[string]*record.Record, rightRec *record.Record, rightAlias string, tableMap map[string]*tableContext, leftSchema *record.Schema, rightSchema *record.Schema) (bool, error) {
 	// Get left value
@@ -1727,4 +1743,133 @@ func rowToKey(row []interface{}) string {
 		}
 	}
 	return key
+}
+
+// evaluateJoinedRowWhere evaluates WHERE condition on a joined row
+func (e *Executor) evaluateJoinedRowWhere(expr citrinelexer.Expression, jr *joinedRow, tableMap map[string]*tableContext) (bool, error) {
+	switch ex := expr.(type) {
+	case *citrinelexer.BinaryExpression:
+		return e.evaluateJoinedRowBinaryExpr(ex, jr, tableMap)
+	case *citrinelexer.BooleanLiteral:
+		return ex.Value, nil
+	case *citrinelexer.InExpression:
+		return e.evaluateJoinedRowIn(ex, jr, tableMap)
+	case *citrinelexer.BetweenExpression:
+		return e.evaluateJoinedRowBetween(ex, jr, tableMap)
+	default:
+		return false, ErrInvalidExpression
+	}
+}
+
+// evaluateJoinedRowBinaryExpr evaluates a binary expression on joined row
+func (e *Executor) evaluateJoinedRowBinaryExpr(expr *citrinelexer.BinaryExpression, jr *joinedRow, tableMap map[string]*tableContext) (bool, error) {
+	switch expr.Operator {
+	case "AND":
+		left, err := e.evaluateJoinedRowWhere(expr.Left, jr, tableMap)
+		if err != nil {
+			return false, err
+		}
+		if !left {
+			return false, nil
+		}
+		return e.evaluateJoinedRowWhere(expr.Right, jr, tableMap)
+	case "OR":
+		left, err := e.evaluateJoinedRowWhere(expr.Left, jr, tableMap)
+		if err != nil {
+			return false, err
+		}
+		if left {
+			return true, nil
+		}
+		return e.evaluateJoinedRowWhere(expr.Right, jr, tableMap)
+	}
+
+	leftVal := e.getJoinedRowValue(expr.Left, jr, tableMap)
+	rightVal := e.getJoinedRowValue(expr.Right, jr, tableMap)
+
+	return e.compare(leftVal, rightVal, expr.Operator)
+}
+
+// getJoinedRowValue extracts a value from joined row based on expression
+func (e *Executor) getJoinedRowValue(expr citrinelexer.Expression, jr *joinedRow, tableMap map[string]*tableContext) interface{} {
+	switch ex := expr.(type) {
+	case *citrinelexer.QualifiedIdentifier:
+		rec := jr.records[ex.Table]
+		if rec == nil {
+			return nil
+		}
+		tableCtx := tableMap[ex.Table]
+		if tableCtx == nil {
+			return nil
+		}
+		colIdx, ok := tableCtx.tableInfo.Schema.FieldIndex(ex.Column)
+		if !ok {
+			return nil
+		}
+		val, _ := rec.Get(colIdx)
+		return valueToInterface(val)
+
+	case *citrinelexer.Identifier:
+		// Try to find in any table
+		for alias, rec := range jr.records {
+			if rec == nil {
+				continue
+			}
+			tableCtx := tableMap[alias]
+			if tableCtx == nil {
+				continue
+			}
+			colIdx, ok := tableCtx.tableInfo.Schema.FieldIndex(ex.Name)
+			if ok {
+				val, _ := rec.Get(colIdx)
+				return valueToInterface(val)
+			}
+		}
+		return nil
+
+	case *citrinelexer.StringLiteral:
+		return ex.Value
+	case *citrinelexer.NumberLiteral:
+		return ex.Value
+	case *citrinelexer.BooleanLiteral:
+		return ex.Value
+	case *citrinelexer.NullLiteral:
+		return nil
+	default:
+		return e.expressionToInterface(expr)
+	}
+}
+
+// evaluateJoinedRowIn evaluates IN expression on joined row
+func (e *Executor) evaluateJoinedRowIn(expr *citrinelexer.InExpression, jr *joinedRow, tableMap map[string]*tableContext) (bool, error) {
+	val := e.getJoinedRowValue(expr.Expr, jr, tableMap)
+	if val == nil {
+		return expr.Not, nil // NULL IN (...) is false, NULL NOT IN (...) is true
+	}
+
+	valStr := fmt.Sprintf("%v", val)
+
+	for _, item := range expr.Values {
+		itemVal := e.getJoinedRowValue(item, jr, tableMap)
+		itemStr := fmt.Sprintf("%v", itemVal)
+		if valStr == itemStr {
+			return !expr.Not, nil
+		}
+	}
+
+	return expr.Not, nil
+}
+
+// evaluateJoinedRowBetween evaluates BETWEEN expression on joined row
+func (e *Executor) evaluateJoinedRowBetween(expr *citrinelexer.BetweenExpression, jr *joinedRow, tableMap map[string]*tableContext) (bool, error) {
+	val := e.getJoinedRowValue(expr.Expr, jr, tableMap)
+	low := e.getJoinedRowValue(expr.Low, jr, tableMap)
+	high := e.getJoinedRowValue(expr.High, jr, tableMap)
+
+	result := compareNumeric(val, low) >= 0 && compareNumeric(val, high) <= 0
+
+	if expr.Not {
+		return !result, nil
+	}
+	return result, nil
 }
