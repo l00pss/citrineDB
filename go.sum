@@ -12,6 +12,10 @@ github.com/l00pss/citrinelexer v0.1.5 h1:DTCOR0/3fdBZGznW9EBO38t5TSHJljj6mQT28EP
 github.com/l00pss/citrinelexer v0.1.5/go.mod h1:GC56cJTchV4WgjxYdq37z/1N4Mzo205wJF0jegE0OmE=
 github.com/l00pss/citrinelexer v0.1.6 h1:WhJFxKqGOHGyff68kPWTddL3w/uc7zRI2KJBVkrxnHE=
 github.com/l00pss/citrinelexer v0.1.6/go.mod h1:GC56cJTchV4WgjxYdq37z/1N4Mzo205wJF0jegE0OmE=
+github.com/l00pss/citrinelexer v0.1.7 h1:D2a8taax7guEkt81dPk5TcXloZBVjLpA38TwwE5X058=
+github.com/l00pss/citrinelexer v0.1.7/go.mod h1:GC56cJTchV4WgjxYdq37z/1N4Mzo205wJF0jegE0OmE=
+github.com/l00pss/citrinelexer v0.1.71 h1:7cnQSJ8GSLbTZtb0ruxtbB1fgUcfzrAf1dVc3rhcaMc=
+github.com/l00pss/citrinelexer v0.1.71/go.mod h1:GC56cJTchV4WgjxYdq37z/1N4Mzo205wJF0jegE0OmE=
 github.com/l00pss/helpme/result v1.0.1 h1:jqzYYMXpSw1SXhsjQps3aVnoVO/omxscwuQRRUa7Yvc=
 github.com/l00pss/helpme/result v1.0.1/go.mod h1:nIM0dE6A3ydc0xsbSdk6/TvsjCgpuzErU0orPgYxjYU=
 github.com/l00pss/littlecache v1.0.0 h1:qq+T1QR64JQqRALf3URJpytKVGggOJRr8pdxvbtl/MU=

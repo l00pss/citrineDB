@@ -868,8 +868,12 @@ Application → Prepare(sql) → Parse placeholders → Store template
 |---------|--------|---------|
 | CREATE TABLE | ✅ | `CREATE TABLE t (id INTEGER, name TEXT)` |
 | DROP TABLE | ✅ | `DROP TABLE t` |
+| CREATE INDEX | ✅ | `CREATE INDEX idx ON t (col)` |
+| CREATE UNIQUE INDEX | ✅ | `CREATE UNIQUE INDEX idx ON t (col)` |
+| DROP INDEX | ✅ | `DROP INDEX idx` |
 | INSERT | ✅ | `INSERT INTO t VALUES (1, 'a')` |
 | SELECT | ✅ | `SELECT * FROM t WHERE id = 1` |
+| SELECT DISTINCT | ✅ | `SELECT DISTINCT name FROM t` |
 | UPDATE | ✅ | `UPDATE t SET x = x + 1 WHERE id = 1` |
 | DELETE | ✅ | `DELETE FROM t WHERE id = 1` |
 | JOIN | ✅ | `SELECT * FROM a INNER JOIN b ON a.id = b.id` |

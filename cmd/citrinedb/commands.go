@@ -23,6 +23,8 @@ func handleDotCommand(db *engine.DB, cmd string) {
 		os.Exit(0)
 	case ".tables":
 		showTables(db)
+	case ".indexes":
+		showIndexes(db)
 	case ".schema":
 		if len(parts) > 1 {
 			showSchema(db, parts[1])
@@ -46,6 +48,7 @@ func printHelp() {
 	fmt.Println(".help         Show help")
 	fmt.Println(".quit         Exit")
 	fmt.Println(".tables       List tables")
+	fmt.Println(".indexes      List indexes")
 	fmt.Println(".schema TABLE Show schema")
 	fmt.Println(".stats        Show stats")
 	fmt.Println(".read FILE    Execute SQL file")
@@ -67,6 +70,28 @@ func showTables(db *engine.DB) {
 		if len(r) > 0 {
 			fmt.Println(r[0])
 		}
+	}
+}
+
+func showIndexes(db *engine.DB) {
+	s := db.Stats()
+	if s.IndexCount == 0 {
+		fmt.Println("(no indexes)")
+		return
+	}
+	cat := db.Catalog()
+	indexes := cat.ListIndexes()
+	for _, name := range indexes {
+		info, err := cat.GetIndex(name)
+		if err != nil {
+			continue
+		}
+		uniqueStr := ""
+		if info.Unique {
+			uniqueStr = "UNIQUE "
+		}
+		cols := strings.Join(info.Columns, ", ")
+		fmt.Printf("%s: %sINDEX ON %s (%s)\n", name, uniqueStr, info.TableName, cols)
 	}
 }
 

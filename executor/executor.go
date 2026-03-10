@@ -77,6 +77,10 @@ func (e *Executor) ExecuteStatement(stmt citrinelexer.Statement) (*Result, error
 	switch s := stmt.(type) {
 	case *citrinelexer.CreateTableStatement:
 		return e.executeCreateTable(s)
+	case *citrinelexer.CreateIndexStatement:
+		return e.executeCreateIndex(s)
+	case *citrinelexer.DropIndexStatement:
+		return e.executeDropIndex(s)
 	case *citrinelexer.SelectStatement:
 		return e.executeSelect(s)
 	case *citrinelexer.InsertStatement:
@@ -137,6 +141,116 @@ func (e *Executor) executeCreateTable(stmt *citrinelexer.CreateTableStatement) (
 	result := NewResult()
 	result.Message = fmt.Sprintf("Table '%s' created successfully", tableName)
 	return result, nil
+}
+
+// executeCreateIndex handles CREATE INDEX statements
+func (e *Executor) executeCreateIndex(stmt *citrinelexer.CreateIndexStatement) (*Result, error) {
+	indexName := stmt.Name.Name
+	tableName := stmt.Table.Name
+
+	// Check if index already exists
+	if stmt.IfNotExists {
+		if _, err := e.catalog.GetIndex(indexName); err == nil {
+			result := NewResult()
+			result.Message = fmt.Sprintf("Index '%s' already exists", indexName)
+			return result, nil
+		}
+	}
+
+	// Extract column names
+	columns := make([]string, len(stmt.Columns))
+	for i, col := range stmt.Columns {
+		columns[i] = col.Column.Name
+	}
+
+	// Get table info to validate columns and populate index
+	tableInfo, err := e.catalog.GetTable(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("executor: table '%s' not found", tableName)
+	}
+
+	// Validate all columns exist
+	for _, colName := range columns {
+		if _, ok := tableInfo.Schema.FieldIndex(colName); !ok {
+			return nil, fmt.Errorf("executor: column '%s' not found in table '%s'", colName, tableName)
+		}
+	}
+
+	// Create index in catalog
+	indexInfo, err := e.catalog.CreateIndex(indexName, tableName, columns, stmt.Unique)
+	if err != nil {
+		return nil, fmt.Errorf("executor: failed to create index: %w", err)
+	}
+
+	// Populate index with existing data
+	iter := tableInfo.HeapFile.NewIterator()
+	defer iter.Close()
+
+	recordCount := 0
+	for {
+		rec, rid, err := iter.Next()
+		if err != nil {
+			return nil, fmt.Errorf("executor: scan error while building index: %w", err)
+		}
+		if rec == nil {
+			break
+		}
+
+		key := e.buildIndexKey(rec, columns, tableInfo.Schema)
+		if err := indexInfo.BTree.Insert(key, rid); err != nil {
+			// If unique constraint violated, drop the index and return error
+			if stmt.Unique {
+				_ = e.catalog.DropIndex(indexName)
+				return nil, fmt.Errorf("executor: unique constraint violated for key '%s'", key)
+			}
+			return nil, fmt.Errorf("executor: failed to insert into index: %w", err)
+		}
+		recordCount++
+	}
+
+	result := NewResult()
+	if stmt.Unique {
+		result.Message = fmt.Sprintf("Unique index '%s' created on %s(%s) with %d entries",
+			indexName, tableName, joinColumns(columns), recordCount)
+	} else {
+		result.Message = fmt.Sprintf("Index '%s' created on %s(%s) with %d entries",
+			indexName, tableName, joinColumns(columns), recordCount)
+	}
+	return result, nil
+}
+
+// executeDropIndex handles DROP INDEX statements
+func (e *Executor) executeDropIndex(stmt *citrinelexer.DropIndexStatement) (*Result, error) {
+	indexName := stmt.Name.Name
+
+	// Check if index exists
+	if stmt.IfExists {
+		if _, err := e.catalog.GetIndex(indexName); err != nil {
+			result := NewResult()
+			result.Message = fmt.Sprintf("Index '%s' does not exist", indexName)
+			return result, nil
+		}
+	}
+
+	if err := e.catalog.DropIndex(indexName); err != nil {
+		return nil, fmt.Errorf("executor: failed to drop index: %w", err)
+	}
+
+	result := NewResult()
+	result.Message = fmt.Sprintf("Index '%s' dropped successfully", indexName)
+	return result, nil
+}
+
+// joinColumns joins column names with comma for display
+func joinColumns(columns []string) string {
+	result := ""
+	for i, col := range columns {
+		if i > 0 {
+			result += ", "
+		}
+		result += col
+	}
+	return result
 }
 
 // executeSelect handles SELECT statements
@@ -272,6 +386,11 @@ func (e *Executor) executeSelect(stmt *citrinelexer.SelectStatement) (*Result, e
 			row[i] = valueToInterface(val)
 		}
 		result.Rows = append(result.Rows, row)
+	}
+
+	// Apply DISTINCT if specified
+	if stmt.Distinct {
+		result.Rows = removeDuplicateRows(result.Rows)
 	}
 
 	return result, nil
@@ -511,6 +630,17 @@ func (e *Executor) executeUpdate(stmt *citrinelexer.UpdateStatement) (*Result, e
 		updates[colIdx] = assign.Value
 	}
 
+	affectedIndexes := make([]*catalog.IndexInfo, 0)
+	for _, indexInfo := range tableInfo.Indexes {
+		for _, indexCol := range indexInfo.Columns {
+			colIdx, _ := tableInfo.Schema.FieldIndex(indexCol)
+			if _, affected := updates[colIdx]; affected {
+				affectedIndexes = append(affectedIndexes, indexInfo)
+				break
+			}
+		}
+	}
+
 	iter := tableInfo.HeapFile.NewIterator()
 	defer iter.Close()
 
@@ -533,6 +663,13 @@ func (e *Executor) executeUpdate(stmt *citrinelexer.UpdateStatement) (*Result, e
 			}
 		}
 
+		// Store old index keys before update
+		oldKeys := make(map[string]string) // indexName -> oldKey
+		for _, indexInfo := range affectedIndexes {
+			oldKeys[indexInfo.Name] = e.buildIndexKey(rec, indexInfo.Columns, tableInfo.Schema)
+		}
+
+		// Apply updates to record
 		for colIdx, expr := range updates {
 			field := tableInfo.Schema.Fields[colIdx]
 			val, err := e.evaluateExpressionWithContext(expr, field.Type, rec, tableInfo.Schema)
@@ -545,6 +682,19 @@ func (e *Executor) executeUpdate(stmt *citrinelexer.UpdateStatement) (*Result, e
 			}
 
 			rec.Set(colIdx, val)
+		}
+
+		// Update indexes: remove old key, insert new key
+		for _, indexInfo := range affectedIndexes {
+			oldKey := oldKeys[indexInfo.Name]
+			newKey := e.buildIndexKey(rec, indexInfo.Columns, tableInfo.Schema)
+
+			if oldKey != newKey {
+				indexInfo.BTree.Delete(oldKey)
+				if err := indexInfo.BTree.Insert(newKey, rid); err != nil {
+					return nil, fmt.Errorf("executor: index update failed: %w", err)
+				}
+			}
 		}
 
 		if err := tableInfo.HeapFile.Update(rid, rec); err != nil {
@@ -567,7 +717,12 @@ func (e *Executor) executeDelete(stmt *citrinelexer.DeleteStatement) (*Result, e
 	}
 
 	result := NewResult()
-	var toDelete []record.RecordID
+
+	type deleteInfo struct {
+		rid       record.RecordID
+		indexKeys map[string]string // indexName -> key
+	}
+	var toDelete []deleteInfo
 
 	iter := tableInfo.HeapFile.NewIterator()
 	defer iter.Close()
@@ -591,11 +746,27 @@ func (e *Executor) executeDelete(stmt *citrinelexer.DeleteStatement) (*Result, e
 			}
 		}
 
-		toDelete = append(toDelete, rid)
+		// Store index keys for this record before deletion
+		info := deleteInfo{
+			rid:       rid,
+			indexKeys: make(map[string]string),
+		}
+		for _, indexInfo := range tableInfo.Indexes {
+			info.indexKeys[indexInfo.Name] = e.buildIndexKey(rec, indexInfo.Columns, tableInfo.Schema)
+		}
+		toDelete = append(toDelete, info)
 	}
 
-	for _, rid := range toDelete {
-		if err := tableInfo.HeapFile.Delete(rid); err != nil {
+	// Delete records and update indexes
+	for _, info := range toDelete {
+		// Remove from all indexes first
+		for indexName, key := range info.indexKeys {
+			if indexInfo, ok := tableInfo.Indexes[indexName]; ok {
+				indexInfo.BTree.Delete(key)
+			}
+		}
+
+		if err := tableInfo.HeapFile.Delete(info.rid); err != nil {
 			return nil, fmt.Errorf("executor: delete failed: %w", err)
 		}
 		result.RowsAffected++
@@ -613,7 +784,6 @@ func (e *Executor) evaluateWhere(expr citrinelexer.Expression, rec *record.Recor
 	case *citrinelexer.BooleanLiteral:
 		return ex.Value, nil
 	case *citrinelexer.Identifier:
-		// Check if it's a column with boolean value
 		colIdx, ok := schema.FieldIndex(ex.Name)
 		if ok {
 			val, err := rec.Get(colIdx)
@@ -626,6 +796,10 @@ func (e *Executor) evaluateWhere(expr citrinelexer.Expression, rec *record.Recor
 			}
 		}
 		return false, nil
+	case *citrinelexer.BetweenExpression:
+		return e.evaluateBetween(ex, rec, schema)
+	case *citrinelexer.InExpression:
+		return e.evaluateIn(ex, rec, schema)
 	default:
 		return false, ErrInvalidExpression
 	}
@@ -689,6 +863,14 @@ func (e *Executor) compare(left, right interface{}, op string) (bool, error) {
 		return compareNumeric(left, right) > 0, nil
 	case ">=":
 		return compareNumeric(left, right) >= 0, nil
+	case "LIKE":
+		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)), nil
+	case "NOT LIKE":
+		return !matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)), nil
+	case "GLOB":
+		return matchGlob(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)), nil
+	case "NOT GLOB":
+		return !matchGlob(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right)), nil
 	default:
 		return false, fmt.Errorf("executor: unsupported operator '%s'", op)
 	}
@@ -728,10 +910,149 @@ func toFloat64(v interface{}) float64 {
 	}
 }
 
+// evaluateBetween evaluates a BETWEEN expression
+func (e *Executor) evaluateBetween(expr *citrinelexer.BetweenExpression, rec *record.Record, schema *record.Schema) (bool, error) {
+	// Get the value to check
+	var val interface{}
+	if ident, ok := expr.Expr.(*citrinelexer.Identifier); ok {
+		colIdx, ok := schema.FieldIndex(ident.Name)
+		if !ok {
+			return false, fmt.Errorf("executor: column '%s' not found", ident.Name)
+		}
+		v, err := rec.Get(colIdx)
+		if err != nil {
+			return false, err
+		}
+		val = valueToInterface(v)
+	} else {
+		val = e.expressionToInterface(expr.Expr)
+	}
+
+	low := e.expressionToInterface(expr.Low)
+	high := e.expressionToInterface(expr.High)
+
+	// Compare: val >= low AND val <= high
+	result := compareNumeric(val, low) >= 0 && compareNumeric(val, high) <= 0
+
+	if expr.Not {
+		return !result, nil
+	}
+	return result, nil
+}
+
+// evaluateIn evaluates an IN expression
+func (e *Executor) evaluateIn(expr *citrinelexer.InExpression, rec *record.Record, schema *record.Schema) (bool, error) {
+	// Get the value to check
+	var val interface{}
+	if ident, ok := expr.Expr.(*citrinelexer.Identifier); ok {
+		colIdx, ok := schema.FieldIndex(ident.Name)
+		if !ok {
+			return false, fmt.Errorf("executor: column '%s' not found", ident.Name)
+		}
+		v, err := rec.Get(colIdx)
+		if err != nil {
+			return false, err
+		}
+		val = valueToInterface(v)
+	} else {
+		val = e.expressionToInterface(expr.Expr)
+	}
+
+	valStr := fmt.Sprintf("%v", val)
+
+	// Check if value is in the list
+	for _, listItem := range expr.Values {
+		itemVal := e.expressionToInterface(listItem)
+		itemStr := fmt.Sprintf("%v", itemVal)
+		if valStr == itemStr {
+			if expr.Not {
+				return false, nil
+			}
+			return true, nil
+		}
+	}
+
+	if expr.Not {
+		return true, nil
+	}
+	return false, nil
+}
+
+// matchLike implements SQL LIKE pattern matching
+// % matches any sequence of characters
+// _ matches any single character
+func matchLike(s, pattern string) bool {
+	return matchPattern(s, pattern, '%', '_', false)
+}
+
+// matchGlob implements SQL GLOB pattern matching
+// * matches any sequence of characters
+// ? matches any single character
+// GLOB is case-sensitive
+func matchGlob(s, pattern string) bool {
+	return matchPattern(s, pattern, '*', '?', true)
+}
+
+// matchPattern performs pattern matching with configurable wildcards
+func matchPattern(s, pattern string, anyChar, oneChar rune, caseSensitive bool) bool {
+	if !caseSensitive {
+		s = toLower(s)
+		pattern = toLower(pattern)
+	}
+
+	sp := 0 // string position
+	pp := 0 // pattern position
+	starIdx := -1
+	match := 0
+
+	patternRunes := []rune(pattern)
+	strRunes := []rune(s)
+
+	for sp < len(strRunes) {
+		if pp < len(patternRunes) && patternRunes[pp] == anyChar {
+			// '*' or '%' - save position
+			starIdx = pp
+			match = sp
+			pp++
+		} else if pp < len(patternRunes) && (patternRunes[pp] == oneChar || patternRunes[pp] == strRunes[sp]) {
+			// '?' or '_' matches single char, or exact match
+			sp++
+			pp++
+		} else if starIdx != -1 {
+			// No match, but we have a previous star - backtrack
+			pp = starIdx + 1
+			match++
+			sp = match
+		} else {
+			return false
+		}
+	}
+
+	// Check remaining pattern characters (should all be anyChar)
+	for pp < len(patternRunes) && patternRunes[pp] == anyChar {
+		pp++
+	}
+
+	return pp == len(patternRunes)
+}
+
+// toLower converts string to lowercase (simple ASCII)
+func toLower(s string) string {
+	result := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			result[i] = c + 32
+		} else {
+			result[i] = c
+		}
+	}
+	return string(result)
+}
+
 func (e *Executor) expressionToInterface(expr citrinelexer.Expression) interface{} {
 	switch ex := expr.(type) {
 	case *citrinelexer.NumberLiteral:
-		// Try to parse as int first, then float
 		if i, err := citrinelexer.ParseInt(ex.Value); err == nil {
 			return i
 		}
@@ -834,7 +1155,6 @@ func (e *Executor) evaluateBinaryExpressionWithContext(expr *citrinelexer.Binary
 		return record.Value{}, err
 	}
 
-	// Convert to float64 for arithmetic
 	leftNum, err := valueToFloat64(leftVal)
 	if err != nil {
 		return record.Value{}, fmt.Errorf("left operand: %w", err)
@@ -1196,9 +1516,12 @@ func (e *Executor) executeSelectJoin(stmt *citrinelexer.SelectStatement) (*Resul
 		// Perform join
 		newJoinedRows := make([]*joinedRow, 0)
 
+		// Track which right rows have been matched (for RIGHT/FULL JOIN)
+		rightMatched := make([]bool, len(joinTableRows))
+
 		for _, jr := range joinedRows {
 			matched := false
-			for _, rightRec := range joinTableRows {
+			for i, rightRec := range joinTableRows {
 				// Check join condition
 				if ji.condition != nil {
 					match, err := e.evaluateJoinCondition(ji.condition, jr.records, rightRec, ji.alias, tableMap, leftTableInfo.Schema, ji.tableCtx.tableInfo.Schema)
@@ -1218,16 +1541,34 @@ func (e *Executor) executeSelectJoin(stmt *citrinelexer.SelectStatement) (*Resul
 				newJR.records[ji.alias] = rightRec
 				newJoinedRows = append(newJoinedRows, newJR)
 				matched = true
+				rightMatched[i] = true
 			}
 
-			// For LEFT JOIN, include unmatched left rows
-			if !matched && ji.joinType == "LEFT" {
+			// For LEFT JOIN or FULL JOIN, include unmatched left rows
+			if !matched && (ji.joinType == "LEFT" || ji.joinType == "FULL") {
 				newJR := &joinedRow{records: make(map[string]*record.Record)}
 				for k, v := range jr.records {
 					newJR.records[k] = v
 				}
 				newJR.records[ji.alias] = nil // NULL for right side
 				newJoinedRows = append(newJoinedRows, newJR)
+			}
+		}
+
+		// For RIGHT JOIN or FULL JOIN, include unmatched right rows
+		if ji.joinType == "RIGHT" || ji.joinType == "FULL" {
+			for i, rightRec := range joinTableRows {
+				if !rightMatched[i] {
+					newJR := &joinedRow{records: make(map[string]*record.Record)}
+					// Set all left-side aliases to nil
+					for alias := range tableMap {
+						if alias != ji.alias {
+							newJR.records[alias] = nil
+						}
+					}
+					newJR.records[ji.alias] = rightRec
+					newJoinedRows = append(newJoinedRows, newJR)
+				}
 			}
 		}
 
@@ -1302,6 +1643,11 @@ func (e *Executor) executeSelectJoin(stmt *citrinelexer.SelectStatement) (*Resul
 		result.Rows = append(result.Rows, row)
 	}
 
+	// Apply DISTINCT if specified
+	if stmt.Distinct {
+		result.Rows = removeDuplicateRows(result.Rows)
+	}
+
 	return result, nil
 }
 
@@ -1345,4 +1691,40 @@ func (e *Executor) evaluateJoinCondition(cond *citrinelexer.BinaryExpression, le
 	}
 
 	return e.compare(leftVal, rightVal, cond.Operator)
+}
+
+// removeDuplicateRows removes duplicate rows from result set for DISTINCT
+func removeDuplicateRows(rows [][]interface{}) [][]interface{} {
+	if len(rows) == 0 {
+		return rows
+	}
+
+	seen := make(map[string]bool)
+	result := make([][]interface{}, 0, len(rows))
+
+	for _, row := range rows {
+		key := rowToKey(row)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, row)
+		}
+	}
+
+	return result
+}
+
+// rowToKey converts a row to a string key for duplicate detection
+func rowToKey(row []interface{}) string {
+	key := ""
+	for i, val := range row {
+		if i > 0 {
+			key += "|"
+		}
+		if val == nil {
+			key += "<NULL>"
+		} else {
+			key += fmt.Sprintf("%v", val)
+		}
+	}
+	return key
 }
